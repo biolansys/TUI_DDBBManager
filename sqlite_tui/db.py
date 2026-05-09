@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import sqlite3
 from pathlib import Path
 from typing import Iterable
@@ -182,3 +183,60 @@ class SQLiteManager:
         cols = [d[0] for d in cur.description] if cur.description else []
         rows = [tuple(row) for row in cur.fetchall()]
         return cols, rows
+
+    def table_exists(self, table_name: str) -> bool:
+        conn = self.require_conn()
+        cur = conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+            LIMIT 1
+            """,
+            (table_name,),
+        )
+        return cur.fetchone() is not None
+
+    def import_csv(self, file_path: Path, table_name: str, create_if_missing: bool) -> int:
+        with file_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                raise ValueError("CSV file has no header.")
+            columns = [c.strip() for c in reader.fieldnames if c and c.strip()]
+            if not columns:
+                raise ValueError("CSV header is empty.")
+            rows = []
+            for row in reader:
+                rows.append(tuple(row.get(col) for col in columns))
+        return self._import_rows(table_name, columns, rows, create_if_missing=create_if_missing)
+
+    def import_parquet(self, file_path: Path, table_name: str, create_if_missing: bool) -> int:
+        try:
+            import pandas as pd  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Parquet import requires pandas (and pyarrow/fastparquet).") from exc
+        df = pd.read_parquet(file_path)
+        columns = [str(c) for c in df.columns]
+        if not columns:
+            raise ValueError("Parquet file has no columns.")
+        rows = [tuple(None if v != v else v for v in row) for row in df.itertuples(index=False, name=None)]
+        return self._import_rows(table_name, columns, rows, create_if_missing=create_if_missing)
+
+    def _import_rows(
+        self,
+        table_name: str,
+        columns: list[str],
+        rows: list[tuple],
+        create_if_missing: bool,
+    ) -> int:
+        conn = self.require_conn()
+        escaped_table = table_name.replace('"', '""')
+        escaped_cols = [f'"{c.replace(chr(34), chr(34) * 2)}"' for c in columns]
+        if create_if_missing and not self.table_exists(table_name):
+            col_defs = ", ".join(f'{c} TEXT' for c in escaped_cols)
+            conn.execute(f'CREATE TABLE "{escaped_table}" ({col_defs})')
+        placeholders = ", ".join(["?"] * len(columns))
+        sql = f'INSERT INTO "{escaped_table}" ({", ".join(escaped_cols)}) VALUES ({placeholders})'
+        conn.executemany(sql, rows)
+        conn.commit()
+        return len(rows)

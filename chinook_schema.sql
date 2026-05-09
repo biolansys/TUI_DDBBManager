@@ -1,6 +1,6 @@
 -- SQLite schema export
 -- Source: C:\Varios\IA\TUI\sqlite\chinook.db
--- Generated: 2026-05-09 20:27:27
+-- Generated: 2026-05-09 20:39:36
 
 -- table: albums
 CREATE TABLE "albums"

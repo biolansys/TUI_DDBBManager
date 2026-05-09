@@ -74,16 +74,6 @@ Screen {
     height: 12;
 }
 
-#query-actions {
-    height: 3;
-    layout: horizontal;
-}
-
-#query-actions Button {
-    min-width: 8;
-    margin-right: 1;
-}
-
 .query-table {
     width: 1fr;
     height: 1fr;

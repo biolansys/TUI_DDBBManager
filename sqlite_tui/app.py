@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import time
 from pathlib import Path
@@ -205,9 +206,83 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ExportResultMenuScreen(ModalScreen[Optional[str]]):
+    def compose(self) -> ComposeResult:
+        with Vertical(id="file-picker-modal"):
+            yield Static("Export query result")
+            with Horizontal(id="file-picker-actions"):
+                yield Button("CSV", id="export-csv", variant="primary")
+                yield Button("Parquet", id="export-parquet")
+                yield Button("Cancel", id="export-cancel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "export-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "export-csv":
+            self.dismiss("csv")
+            return
+        if event.button.id == "export-parquet":
+            self.dismiss("parquet")
+            return
+
+
+class ImportFilePickerScreen(ModalScreen[Optional[str]]):
+    def __init__(self, start_path: Path) -> None:
+        super().__init__()
+        self.start_path = start_path
+        self.selected_file: Optional[str] = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="file-picker-modal"):
+            yield Static("Import file to table")
+            yield DirectoryTree(str(self.start_path), id="import-file-tree")
+            with Horizontal(id="file-picker-actions"):
+                yield Button("Parent", id="import-parent")
+                yield Button("Select", id="import-select", variant="primary")
+                yield Button("Cancel", id="import-cancel")
+            yield Static("Select a .csv or .parquet file.", id="import-status")
+
+    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        path = Path(event.path)
+        if path.suffix.lower() not in {".csv", ".parquet"}:
+            self.selected_file = None
+            self.query_one("#import-status", Static).update("Select a .csv or .parquet file.")
+            return
+        self.selected_file = str(path.resolve())
+        self.query_one("#import-status", Static).update(f"Selected: {self.selected_file}")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "import-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id == "import-parent":
+            tree = self.query_one("#import-file-tree", DirectoryTree)
+            current = Path(tree.path)
+            parent = current.parent
+            tree.path = str(parent)
+            tree.reload()
+            self.query_one("#import-status", Static).update(f"Current folder: {parent}")
+            return
+        if event.button.id == "import-select":
+            if not self.selected_file:
+                self.query_one("#import-status", Static).update("Select a file first.")
+                return
+            self.dismiss(self.selected_file)
+
+
 class SQLiteTUI(App):
     CSS_PATH = "app.tcss"
-    BINDINGS = [("ctrl+r", "run_query", "Run Query"), ("ctrl+o", "open_db", "Open DB")]
+    BINDINGS = [
+        ("ctrl+r", "run_query", "Run Query"),
+        ("ctrl+l", "load_query", "Load Query"),
+        ("ctrl+s", "save_query", "Save Query"),
+        ("ctrl+t", "new_query_tab", "New Query Tab"),
+        ("ctrl+e", "export_query_result", "Export Result"),
+        ("ctrl+i", "import_file", "Import File"),
+        ("ctrl+m", "export_markdown", "Export MD"),
+        ("ctrl+d", "export_schema_sql", "Export DDL"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -223,6 +298,7 @@ class SQLiteTUI(App):
         self.selected_cell_row: int | None = None
         self.selected_cell_col: int | None = None
         self.query_tab_count: int = 1
+        self.query_results: dict[str, tuple[list[str], list[tuple]]] = {}
         self._last_conn_click_name: str | None = None
         self._last_conn_click_at: float = 0.0
 
@@ -230,11 +306,11 @@ class SQLiteTUI(App):
         yield Header()
         with Horizontal(id="topbar"):
             yield Input(placeholder="Path to SQLite database file", id="db-path")
-            yield Button("Br", id="browse-db")
+            yield Button("Browse", id="browse-db")
             yield Input(placeholder="Connection name", id="conn-name")
-            yield Button("Op", id="open-db", variant="primary")
-            yield Button("Reg", id="register-conn")
-            yield Button("Ref", id="refresh-schema")
+            yield Button("Opend DB", id="open-db", variant="primary")
+            yield Button("Register", id="register-conn")
+            yield Button("Refresh", id="refresh-schema")
             yield Button("Exit", id="exit-app", variant="error")
         with Horizontal(id="main"):
             with Vertical(id="left-column"):
@@ -254,20 +330,13 @@ class SQLiteTUI(App):
                             yield DataTable(id="data-table")
                             yield TextArea("", id="data-sql")
                         with Horizontal(id="data-actions"):
-                            yield Button("Tx+", id="tx-begin")
-                            yield Button("Tx=", id="tx-commit")
-                            yield Button("Tx-", id="tx-rollback")
-                            yield Button("Ins", id="insert-row")
+                            yield Button("Begin", id="tx-begin")
+                            yield Button("Commit", id="tx-commit")
+                            yield Button("Rollback", id="tx-rollback")
+                            yield Button("Insert", id="insert-row")
                             yield Button("Edit", id="edit-cell")
-                            yield Button("Del", id="delete-row", variant="error")
+                            yield Button("Delete", id="delete-row", variant="error")
                     with TabPane("Query"):
-                        with Horizontal(id="query-actions"):
-                            yield Button("+Tab", id="new-query-tab")
-                            yield Button("Load", id="load-query")
-                            yield Button("Save", id="save-query")
-                            yield Button("Run SQL", id="run-sql", variant="success")
-                            yield Button("MD", id="export-md")
-                            yield Button("DDL", id="export-schema-sql")
                         with TabbedContent(id="query-tabs"):
                             with TabPane("Q1", id="query-pane-1"):
                                 yield TextArea.code_editor(
@@ -437,10 +506,12 @@ class SQLiteTUI(App):
 
     def action_run_query(self) -> None:
         editor, table = self._get_active_query_widgets()
+        suffix = self._get_active_query_suffix()
         sql = editor.text
         table.clear(columns=True)
         try:
             cols, rows, msg = self.db.execute_sql(sql)
+            self.query_results[suffix] = (cols, rows)
             if cols:
                 table.add_columns(*cols)
                 for row in rows:
@@ -511,7 +582,121 @@ class SQLiteTUI(App):
         )
         tabs.add_pane(pane)
         tabs.active = f"query-pane-{n}"
+        self.query_results[str(n)] = ([], [])
         self._set_status(f"Created query tab Q{n}.")
+
+    def action_export_query_result(self) -> None:
+        suffix = self._get_active_query_suffix()
+        cols, rows = self.query_results.get(suffix, ([], []))
+        if not cols:
+            self._set_status("No query result to export in active tab.")
+            return
+
+        def _on_format(selected_format: str | None) -> None:
+            if not selected_format:
+                return
+            default_name = "query_result.csv" if selected_format == "csv" else "query_result.parquet"
+            start_path = Path.cwd()
+            current_path = self.query_one("#db-path", Input).value.strip()
+            if current_path:
+                candidate = Path(current_path).expanduser()
+                if candidate.exists():
+                    start_path = candidate.parent
+
+            def _on_path(raw: str | None) -> None:
+                if not raw:
+                    return
+                try:
+                    path = Path(raw).expanduser().resolve()
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if selected_format == "csv":
+                        if path.suffix.lower() != ".csv":
+                            path = path.with_suffix(".csv")
+                        with path.open("w", newline="", encoding="utf-8") as f:
+                            writer = csv.writer(f)
+                            writer.writerow(cols)
+                            writer.writerows(rows)
+                    else:
+                        if path.suffix.lower() != ".parquet":
+                            path = path.with_suffix(".parquet")
+                        try:
+                            import pandas as pd  # type: ignore[import-not-found]
+                        except Exception as exc:  # noqa: BLE001
+                            raise RuntimeError(
+                                "Parquet export requires pandas (and pyarrow/fastparquet)."
+                            ) from exc
+                        df = pd.DataFrame(rows, columns=cols)
+                        df.to_parquet(path, index=False)
+                    self._set_status(f"Query result exported: {path}")
+                except Exception as exc:  # noqa: BLE001
+                    self._set_status(f"Export failed: {exc}")
+
+            self.push_screen(
+                PromptScreen(
+                    f"Export result as {selected_format.upper()}",
+                    "Output file path",
+                    str((start_path / default_name).resolve()),
+                ),
+                _on_path,
+            )
+
+        self.push_screen(ExportResultMenuScreen(), _on_format)
+
+    def action_import_file(self) -> None:
+        if self.db.path is None:
+            self._set_status("Open a database first.")
+            return
+        start_path = self.db.path.parent if self.db.path else Path.cwd()
+
+        def _on_file(raw_path: str | None) -> None:
+            if not raw_path:
+                return
+            file_path = Path(raw_path).expanduser().resolve()
+            default_table = self._sanitize_table_name(file_path.stem)
+
+            def _on_table(raw_table: str | None) -> None:
+                if not raw_table:
+                    return
+                table_name = self._sanitize_table_name(raw_table)
+                if not table_name:
+                    self._set_status("Invalid table name.")
+                    return
+
+                def _do_import() -> None:
+                    try:
+                        exists = self.db.table_exists(table_name)
+                        create_if_missing = not exists
+                        if file_path.suffix.lower() == ".csv":
+                            inserted = self.db.import_csv(
+                                file_path, table_name, create_if_missing=create_if_missing
+                            )
+                        else:
+                            inserted = self.db.import_parquet(
+                                file_path, table_name, create_if_missing=create_if_missing
+                            )
+                        self._refresh_schema()
+                        self._set_status(
+                            f"Imported {inserted} row(s) into table '{table_name}'."
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        self._set_status(f"Import failed: {exc}")
+
+                if self.db.table_exists(table_name):
+                    self.push_screen(
+                        ConfirmScreen(
+                            f"Table '{table_name}' exists. Load data into existing table?"
+                        ),
+                        lambda ok: _do_import() if ok else self._set_status("Import cancelled."),
+                    )
+                else:
+                    _do_import()
+
+            self.push_screen(
+                PromptScreen("Target table name", "Table name", default_table),
+                _on_table,
+            )
+
+        self.push_screen(ImportFilePickerScreen(start_path), _on_file)
 
     def action_export_markdown(self) -> None:
         if self.db.path is None:
@@ -534,6 +719,9 @@ class SQLiteTUI(App):
             PromptScreen("Export DB report (.md)", "Output file path", default_path),
             _on_path,
         )
+
+    def action_export_md(self) -> None:
+        self.action_export_markdown()
 
     def action_export_schema_sql(self) -> None:
         if self.db.path is None:
@@ -838,6 +1026,7 @@ class SQLiteTUI(App):
             table = self.query_one(f"#query-table-{i}", DataTable)
             editor.text = ""
             table.clear(columns=True)
+            self.query_results[str(i)] = ([], [])
 
     def _get_active_query_widgets(self) -> tuple[TextArea, DataTable]:
         tabs = self.query_one("#query-tabs", TabbedContent)
@@ -846,6 +1035,11 @@ class SQLiteTUI(App):
         editor = self.query_one(f"#query-editor-{suffix}", TextArea)
         table = self.query_one(f"#query-table-{suffix}", DataTable)
         return editor, table
+
+    def _get_active_query_suffix(self) -> str:
+        tabs = self.query_one("#query-tabs", TabbedContent)
+        active = tabs.active or "query-pane-1"
+        return active.replace("query-pane-", "")
 
     def _set_data_sql_text(self, sql_text: str | None) -> None:
         sql_view = self.query_one("#data-sql", TextArea)
@@ -955,6 +1149,13 @@ class SQLiteTUI(App):
 
     def _set_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
+
+    @staticmethod
+    def _sanitize_table_name(value: str) -> str:
+        cleaned = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in value.strip())
+        while "__" in cleaned:
+            cleaned = cleaned.replace("__", "_")
+        return cleaned.strip("_")
 
 
 def main() -> None:
