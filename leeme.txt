@@ -1,7 +1,0 @@
-hay dos directorios, uno para la version de sqlite y el otro para duckdb
-se ejecuta desde fuera de cada subdiretorio con las instrcciones
-python -m duckdb_tui
-python -m sqlite_tui
-
-La version duckdb puede leer ddbb sqlite , pero no muestra triggers
-Algunas ddbb sqlite no las lee
