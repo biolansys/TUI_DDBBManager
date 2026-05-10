@@ -1,6 +1,6 @@
-# DDBB Manager TUI (Textual)
+# DDBB Manager TUI (Textual python library)
 
-Terminal UI app to inspect and manage databases from the terminal, inspired by tools like DBeaver.
+Terminal UI app to inspect and manage DuckDB and SQLite databases from the terminal.
 
 ## Supported Engines
 
