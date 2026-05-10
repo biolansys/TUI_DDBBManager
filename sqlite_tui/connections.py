@@ -29,8 +29,21 @@ class ConnectionStore:
                 conn_type = self._infer_type_from_path(path)
             if conn_type not in {"sqlite", "duckdb"}:
                 conn_type = "sqlite"
+            raw_tags = item.get("tags", [])
+            tags: list[str] = []
+            if isinstance(raw_tags, list):
+                tags = [str(t).strip() for t in raw_tags if str(t).strip()]
+            pinned = bool(item.get("pinned", False))
             if name and path:
-                cleaned.append({"name": name, "path": path, "type": conn_type})
+                cleaned.append(
+                    {
+                        "name": name,
+                        "path": path,
+                        "type": conn_type,
+                        "tags": tags,
+                        "pinned": pinned,
+                    }
+                )
         return cleaned
 
     def save(self, connections: list[dict[str, str]]) -> None:

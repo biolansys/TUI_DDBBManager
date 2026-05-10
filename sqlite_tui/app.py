@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -428,6 +429,7 @@ class ImportWizardScreen(ModalScreen[Optional[dict[str, Any]]]):
 
 class SQLiteTUI(App):
     CSS_PATH = "app.tcss"
+    TITLE = "DDBB Manager"
     BINDINGS = [
         ("ctrl+r", "run_query", "Run Query"),
         ("ctrl+l", "load_query", "Load Query"),
@@ -466,7 +468,9 @@ class SQLiteTUI(App):
         self._last_conn_click_at: float = 0.0
 
     def compose(self) -> ComposeResult:
-        yield Header()
+        yield Header(show_clock=False)
+        with Horizontal(id="header-datetime-row"):
+            yield Static("", id="header-datetime")
         with Horizontal(id="topbar"):
             yield Select(
                 [("SQLite", "sqlite"), ("DuckDB", "duckdb")],
@@ -487,12 +491,14 @@ class SQLiteTUI(App):
                     yield Static("Connections")
                     yield Tree("Saved connections", id="connections-tree")
                     with Horizontal(id="conn-actions"):
+                        yield Button("Pin", id="pin-conn")
+                        yield Button("Tag", id="tag-conn")
                         yield Button("Ren", id="rename-conn")
                         yield Button("Del", id="delete-conn", variant="error")
                         yield Button("Test", id="test-conn")
                 with Vertical(id="db-info-pane"):
-                    yield Static("Database Info")
-                    yield Static("No database open.", id="db-info")
+                    with VerticalScroll(id="db-info-scroll"):
+                        yield Static("No database open.", id="db-info")
             with Vertical(id="schema-pane"):
                 yield Static("Schema")
                 yield Tree("Database objects", id="schema-tree")
@@ -563,8 +569,14 @@ class SQLiteTUI(App):
         for conn in self.connections:
             if "type" not in conn:
                 conn["type"] = "sqlite"
+            if "tags" not in conn:
+                conn["tags"] = []
+            if "pinned" not in conn:
+                conn["pinned"] = False
         self._refresh_connections()
         self._set_status("Set a database file path and press Open.")
+        self._update_header_datetime()
+        self.set_interval(1.0, self._update_header_datetime)
         self._open_last_used_if_available()
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -618,6 +630,10 @@ class SQLiteTUI(App):
             self.action_delete_connection()
         elif event.button.id == "test-conn":
             self.action_test_connection()
+        elif event.button.id == "pin-conn":
+            self.action_toggle_pin_connection()
+        elif event.button.id == "tag-conn":
+            self.action_set_tags_connection()
         elif event.button.id == "apply-ddl":
             self.action_apply_ddl()
         elif event.button.id == "save-ddl":
@@ -741,10 +757,16 @@ class SQLiteTUI(App):
         for idx, conn in enumerate(self.connections):
             if conn["name"] == name:
                 self.connections[idx] = {"name": name, "path": path, "type": self.db_type}
+                if "tags" not in self.connections[idx]:
+                    self.connections[idx]["tags"] = []
+                if "pinned" not in self.connections[idx]:
+                    self.connections[idx]["pinned"] = False
                 replaced = True
                 break
         if not replaced:
-            self.connections.append({"name": name, "path": path, "type": self.db_type})
+            self.connections.append(
+                {"name": name, "path": path, "type": self.db_type, "tags": [], "pinned": False}
+            )
 
         try:
             self.connection_store.save(self.connections)
@@ -826,6 +848,44 @@ class SQLiteTUI(App):
             self._set_status(f"Connection test passed: {self.selected_connection['name']}")
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Connection test failed: {exc}")
+
+    def action_toggle_pin_connection(self) -> None:
+        if not self.selected_connection:
+            self._set_status("Select a connection first.")
+            return
+        current = bool(self.selected_connection.get("pinned", False))
+        self.selected_connection["pinned"] = not current
+        try:
+            self.connection_store.save(self.connections)
+            self._refresh_connections()
+            self._set_status(
+                f"Connection {'pinned' if self.selected_connection['pinned'] else 'unpinned'}."
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._set_status(f"Pin update failed: {exc}")
+
+    def action_set_tags_connection(self) -> None:
+        if not self.selected_connection:
+            self._set_status("Select a connection first.")
+            return
+        existing = ", ".join(self.selected_connection.get("tags", []))
+
+        def _on_tags(raw: str | None) -> None:
+            if raw is None:
+                return
+            tags = [t.strip() for t in raw.split(",") if t.strip()]
+            self.selected_connection["tags"] = tags
+            try:
+                self.connection_store.save(self.connections)
+                self._refresh_connections()
+                self._set_status("Tags updated.")
+            except Exception as exc:  # noqa: BLE001
+                self._set_status(f"Tag update failed: {exc}")
+
+        self.push_screen(
+            PromptScreen("Set tags (comma-separated)", "tag1, tag2", existing),
+            _on_tags,
+        )
 
     def action_run_query(self) -> None:
         self._clear_explain_tab()
@@ -1457,10 +1517,41 @@ class SQLiteTUI(App):
         tree.clear()
         root = tree.root
         root.expand()
-        for conn in self.connections:
-            conn_type = str(conn.get("type", "sqlite")).upper()
-            root.add_leaf(f"{conn['name']} [{conn_type}] ({conn['path']})", data=conn)
+        favorites = [c for c in self.connections if bool(c.get("pinned", False))]
+        non_favorites = [c for c in self.connections if not bool(c.get("pinned", False))]
+
+        fav_node = root.add("Favorites", expand=True)
+        for conn in sorted(favorites, key=lambda c: c["name"].lower()):
+            self._add_connection_leaf(fav_node, conn)
+
+        tag_map: dict[str, list[dict[str, str]]] = {}
+        for conn in non_favorites:
+            for tag in conn.get("tags", []):
+                tag_map.setdefault(str(tag), []).append(conn)
+
+        tags_node = root.add("Tags", expand=True)
+        for tag in sorted(tag_map.keys(), key=lambda t: t.lower()):
+            tag_node = tags_node.add(tag, expand=False)
+            for conn in sorted(tag_map[tag], key=lambda c: c["name"].lower()):
+                self._add_connection_leaf(tag_node, conn)
+
+        others_node = root.add("Others", expand=True)
+        tagged_ids = {id(c) for lst in tag_map.values() for c in lst}
+        for conn in sorted(non_favorites, key=lambda c: c["name"].lower()):
+            if id(conn) in tagged_ids:
+                continue
+            self._add_connection_leaf(others_node, conn)
         tree.root.expand_all()
+
+    def _add_connection_leaf(self, parent_node: Tree.Node, conn: dict[str, str]) -> None:
+        conn_type = str(conn.get("type", "sqlite")).upper()
+        tags = conn.get("tags", [])
+        tags_txt = f" tags={','.join(tags)}" if tags else ""
+        pin = " *" if bool(conn.get("pinned", False)) else ""
+        parent_node.add_leaf(
+            f"{conn['name']}{pin} [{conn_type}] ({conn['path']}){tags_txt}",
+            data=conn,
+        )
 
     def _load_table_preview(self, table_name: str) -> None:
         table = self.query_one("#data-table", DataTable)
@@ -1898,6 +1989,11 @@ class SQLiteTUI(App):
 
     def _set_status(self, message: str) -> None:
         self.query_one("#status", Static).update(message)
+
+    def _update_header_datetime(self) -> None:
+        self.query_one("#header-datetime", Static).update(
+            datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        )
 
     def _open_last_used_if_available(self) -> None:
         last = self.connection_store.load_last_used()

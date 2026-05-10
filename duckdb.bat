@@ -1,1 +1,0 @@
-python - m duckdb_tui
