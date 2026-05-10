@@ -25,7 +25,7 @@ from textual.widgets import (
 )
 
 from .connections import ConnectionStore
-from .db import SQLiteManager
+from .db import DuckDBManager
 
 
 class FilePickerScreen(ModalScreen[Optional[str]]):
@@ -36,7 +36,7 @@ class FilePickerScreen(ModalScreen[Optional[str]]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="file-picker-modal"):
-            yield Static("Select a SQLite database file")
+            yield Static("Select a DuckDB database file")
             yield DirectoryTree(str(self.start_path), id="file-tree")
             with Horizontal(id="file-picker-actions"):
                 yield Button("Parent", id="goto-parent")
@@ -46,9 +46,9 @@ class FilePickerScreen(ModalScreen[Optional[str]]):
 
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         path = Path(event.path)
-        if path.suffix.lower() not in {".db", ".db3", ".sqlite", ".sqlite3"}:
+        if path.suffix.lower() not in {".duckdb", ".ddb", ".db"}:
             self.query_one("#file-picker-status", Static).update(
-                "Select a .db, .db3, .sqlite, or .sqlite3 file."
+                "Select a .duckdb, .ddb, or .db file."
             )
             self.selected_file = None
             return
@@ -271,7 +271,7 @@ class ImportFilePickerScreen(ModalScreen[Optional[str]]):
             self.dismiss(self.selected_file)
 
 
-class SQLiteTUI(App):
+class DuckDBTUI(App):
     CSS_PATH = "app.tcss"
     BINDINGS = [
         ("ctrl+r", "run_query", "Run Query"),
@@ -286,7 +286,7 @@ class SQLiteTUI(App):
 
     def __init__(self) -> None:
         super().__init__()
-        self.db = SQLiteManager()
+        self.db = DuckDBManager()
         self.connection_store = ConnectionStore()
         self.connections: list[dict[str, str]] = []
         self.selected_connection: dict[str, str] | None = None
@@ -305,14 +305,12 @@ class SQLiteTUI(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal(id="topbar"):
-            yield Input(placeholder="Path to SQLite database file", id="db-path")
+            yield Input(placeholder="Path to DuckDB database file", id="db-path")
             yield Button("Browse", id="browse-db")
             yield Input(placeholder="Connection name", id="conn-name")
             yield Button("Opend DB", id="open-db", variant="primary")
             yield Button("Register", id="register-conn")
             yield Button("Refresh", id="refresh-schema")
-            yield Button("MD", id="export-md")
-            yield Button("DDL", id="export-schema-sql")
             yield Button("Exit", id="exit-app", variant="error")
         with Horizontal(id="main"):
             with Vertical(id="left-column"):
@@ -359,7 +357,7 @@ class SQLiteTUI(App):
         data_sql.display = False
         self.connections = self.connection_store.load()
         self._refresh_connections()
-        self._set_status("Set a SQLite file path and press Open.")
+        self._set_status("Set a DuckDB file path and press Open.")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "open-db":
@@ -1128,7 +1126,7 @@ class SQLiteTUI(App):
         if self.db.path is None:
             return "-- No database open.\n"
         lines: list[str] = []
-        lines.append("-- SQLite schema export")
+        lines.append("-- DuckDB schema export")
         lines.append(f"-- Source: {self.db.path}")
         lines.append(
             f"-- Generated: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}"
@@ -1161,4 +1159,4 @@ class SQLiteTUI(App):
 
 
 def main() -> None:
-    SQLiteTUI().run()
+    DuckDBTUI().run()

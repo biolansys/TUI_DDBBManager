@@ -1,0 +1,123 @@
+Screen {
+    layout: vertical;
+}
+
+#topbar {
+    height: 3;
+    layout: horizontal;
+    padding: 0;
+}
+
+#topbar Button {
+    padding: 0 0;
+}
+
+#topbar Input {
+    padding: 0 0;
+}
+
+#db-path {
+    width: 1fr;
+    margin-right: 1;
+}
+
+#conn-name {
+    width: 24;
+    margin-right: 1;
+}
+
+#main {
+    layout: horizontal;
+    height: 1fr;
+}
+
+#left-column {
+    width: 34;
+    margin: 0 0 0 0;
+}
+
+#connections-pane {
+    height: 1fr;
+    border: round $accent;
+    margin: 0;
+}
+
+#db-info-pane {
+    height: 8;
+    border: round $accent;
+    padding: 0;
+}
+
+#db-info {
+    color: $text;
+}
+
+#schema-pane {
+    width: 46;
+    border: round $accent;
+    margin: 0 0 0 0;
+}
+
+#workspace {
+    width: 1fr;
+    border: round $accent;
+    margin: 0;
+}
+
+#status {
+    height: 1;
+    padding: 0;
+    color: $text-muted;
+}
+
+.query-editor {
+    height: 12;
+}
+
+.query-table {
+    width: 1fr;
+    height: 1fr;
+}
+
+#data-scroll {
+    height: 1fr;
+}
+
+#data-actions {
+    height: 3;
+    layout: horizontal;
+}
+
+#data-actions Button {
+    min-width: 8;
+    margin-right: 1;
+}
+
+#data-sql {
+    height: 10;
+    margin-top: 1;
+}
+
+#file-picker-modal {
+    width: 90%;
+    height: 90%;
+    border: round $accent;
+    padding: 0;
+    background: $panel;
+}
+
+#file-tree {
+    height: 1fr;
+    margin: 0;
+}
+
+#file-picker-actions {
+    height: 3;
+    layout: horizontal;
+}
+
+#file-picker-status {
+    height: 1;
+    color: $text-muted;
+    margin-top: 0;
+}
