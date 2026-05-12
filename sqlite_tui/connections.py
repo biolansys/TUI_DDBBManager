@@ -27,7 +27,7 @@ class ConnectionStore:
             conn_type = str(item.get("type", "")).strip().lower()
             if not conn_type:
                 conn_type = self._infer_type_from_path(path)
-            if conn_type not in {"sqlite", "duckdb"}:
+            if conn_type not in {"sqlite", "duckdb", "mysql"}:
                 conn_type = "sqlite"
             raw_tags = item.get("tags", [])
             tags: list[str] = []
@@ -89,6 +89,8 @@ class ConnectionStore:
 
     @staticmethod
     def _infer_type_from_path(path: str) -> str:
+        if path.lower().startswith("mysql://"):
+            return "mysql"
         suffix = Path(path).suffix.lower()
         if suffix in {".duckdb", ".ddb"}:
             return "duckdb"

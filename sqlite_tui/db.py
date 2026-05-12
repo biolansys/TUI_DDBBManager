@@ -4,8 +4,10 @@ import csv
 import sqlite3
 from pathlib import Path
 from typing import Iterable, Protocol
+from urllib.parse import parse_qs, unquote, urlparse
 
 import duckdb
+import mysql.connector
 
 
 class DBManagerProtocol(Protocol):
@@ -442,3 +444,316 @@ class DuckDBManager:
             rows,
         )
         return len(rows)
+
+
+class MySQLManager:
+    def __init__(self) -> None:
+        self.conn: mysql.connector.MySQLConnection | None = None
+        self.path: Path | None = None
+        self._db_name: str = ""
+        self._pk_map: dict[int, tuple[list[str], tuple]] = {}
+
+    def connect(self, db_path: str) -> None:
+        parsed = urlparse(db_path)
+        if parsed.scheme.lower() != "mysql":
+            raise ValueError("MySQL connection must use URI format: mysql://user:pass@host:3306/database")
+        user = unquote(parsed.username or "")
+        password = unquote(parsed.password or "")
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 3306
+        database = (parsed.path or "").lstrip("/")
+        if not user or not database:
+            raise ValueError("MySQL URI must include user and database.")
+        self.close()
+        self.conn = mysql.connector.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=database,
+            autocommit=False,
+        )
+        self._db_name = database
+        self.path = Path(f"mysql_{database}.conn")
+
+    def close(self) -> None:
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+        self.path = None
+        self._db_name = ""
+        self._pk_map = {}
+
+    def require_conn(self) -> mysql.connector.MySQLConnection:
+        if self.conn is None:
+            raise RuntimeError("No database connection. Open a MySQL connection first.")
+        return self.conn
+
+    def list_objects(self) -> list[tuple[str, str]]:
+        conn = self.require_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT TABLE_TYPE, TABLE_NAME
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE()
+            ORDER BY TABLE_TYPE, TABLE_NAME
+            """
+        )
+        rows: list[tuple[str, str]] = []
+        for table_type, name in cur.fetchall():
+            rows.append(("table" if str(table_type) == "BASE TABLE" else "view", str(name)))
+        cur.execute(
+            """
+            SELECT INDEX_NAME, TABLE_NAME
+            FROM information_schema.statistics
+            WHERE table_schema = DATABASE()
+              AND INDEX_NAME <> 'PRIMARY'
+            GROUP BY INDEX_NAME, TABLE_NAME
+            ORDER BY INDEX_NAME
+            """
+        )
+        for idx, tbl in cur.fetchall():
+            rows.append(("index", f"{tbl}.{idx}"))
+        cur.close()
+        order = {"table": 1, "view": 2, "index": 3, "trigger": 4}
+        rows.sort(key=lambda x: (order.get(x[0], 99), x[1]))
+        return rows
+
+    def _get_pk_columns(self, table_name: str) -> list[str]:
+        conn = self.require_conn()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT COLUMN_NAME
+            FROM information_schema.key_column_usage
+            WHERE table_schema = DATABASE()
+              AND table_name = %s
+              AND constraint_name = 'PRIMARY'
+            ORDER BY ORDINAL_POSITION
+            """,
+            (table_name,),
+        )
+        cols = [str(r[0]) for r in cur.fetchall()]
+        cur.close()
+        return cols
+
+    def preview_table_with_rowid(
+        self, table_name: str, limit: int = 200, offset: int = 0
+    ) -> tuple[list[str], list[tuple], list[int]]:
+        conn = self.require_conn()
+        cur = conn.cursor()
+        cur.execute(f"SELECT * FROM `{table_name}` LIMIT %s OFFSET %s", (int(limit), int(offset)))
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchall()
+        cur.close()
+
+        pk_cols = self._get_pk_columns(table_name)
+        self._pk_map = {}
+        rowids: list[int] = []
+        for idx, row in enumerate(rows, start=1):
+            rowids.append(idx)
+            if pk_cols:
+                pos = [cols.index(c) for c in pk_cols if c in cols]
+                if len(pos) == len(pk_cols):
+                    self._pk_map[idx] = (pk_cols, tuple(row[p] for p in pos))
+        return cols, [tuple(r) for r in rows], rowids
+
+    def execute_sql(self, sql: str) -> tuple[list[str], list[tuple], str]:
+        conn = self.require_conn()
+        query = sql.strip()
+        if not query:
+            return [], [], "No SQL to execute."
+        cur = conn.cursor()
+        cur.execute(query)
+        if cur.description:
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            cur.close()
+            return cols, [tuple(r) for r in rows], f"{len(rows)} row(s)."
+        affected = cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+        cur.close()
+        return [], [], f"Statement executed. Affected rows: {affected}."
+
+    def begin_transaction(self) -> None:
+        self.require_conn().start_transaction()
+
+    def commit_transaction(self) -> None:
+        self.require_conn().commit()
+
+    def rollback_transaction(self) -> None:
+        self.require_conn().rollback()
+
+    def update_cell_by_rowid(
+        self, table_name: str, column_name: str, rowid: int, new_value: object
+    ) -> None:
+        if rowid not in self._pk_map:
+            raise RuntimeError("MySQL edit requires table with PRIMARY KEY in current preview page.")
+        pk_cols, pk_vals = self._pk_map[rowid]
+        where = " AND ".join([f"`{c}` = %s" for c in pk_cols])
+        sql = f"UPDATE `{table_name}` SET `{column_name}` = %s WHERE {where}"
+        params = [new_value, *pk_vals]
+        cur = self.require_conn().cursor()
+        cur.execute(sql, params)
+        cur.close()
+
+    def delete_row_by_rowid(self, table_name: str, rowid: int) -> None:
+        if rowid not in self._pk_map:
+            raise RuntimeError("MySQL delete requires table with PRIMARY KEY in current preview page.")
+        pk_cols, pk_vals = self._pk_map[rowid]
+        where = " AND ".join([f"`{c}` = %s" for c in pk_cols])
+        sql = f"DELETE FROM `{table_name}` WHERE {where}"
+        cur = self.require_conn().cursor()
+        cur.execute(sql, list(pk_vals))
+        cur.close()
+
+    def insert_row(self, table_name: str, values: dict[str, object]) -> None:
+        if not values:
+            raise ValueError("No values provided for insert.")
+        cols = [f"`{c}`" for c in values]
+        placeholders = ", ".join(["%s"] * len(values))
+        sql = f"INSERT INTO `{table_name}` ({', '.join(cols)}) VALUES ({placeholders})"
+        cur = self.require_conn().cursor()
+        cur.execute(sql, list(values.values()))
+        cur.close()
+
+    def list_columns(self, table_name: str) -> Iterable[str]:
+        cur = self.require_conn().cursor()
+        cur.execute(
+            """
+            SELECT COLUMN_NAME
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE() AND table_name = %s
+            ORDER BY ORDINAL_POSITION
+            """,
+            (table_name,),
+        )
+        for row in cur.fetchall():
+            yield str(row[0])
+        cur.close()
+
+    def list_columns_with_types(self, table_name: str) -> Iterable[tuple[str, str]]:
+        cur = self.require_conn().cursor()
+        cur.execute(
+            """
+            SELECT COLUMN_NAME, COLUMN_TYPE
+            FROM information_schema.columns
+            WHERE table_schema = DATABASE() AND table_name = %s
+            ORDER BY ORDINAL_POSITION
+            """,
+            (table_name,),
+        )
+        for row in cur.fetchall():
+            yield str(row[0]), str(row[1] or "UNKNOWN")
+        cur.close()
+
+    def count_rows(self, table_name: str) -> int:
+        cur = self.require_conn().cursor()
+        cur.execute(f"SELECT COUNT(*) FROM `{table_name}`")
+        row = cur.fetchone()
+        cur.close()
+        return int(row[0] if row else 0)
+
+    def get_object_sql(self, object_type: str, object_name: str) -> str:
+        cur = self.require_conn().cursor()
+        if object_type in {"table", "view"}:
+            cur.execute("SHOW CREATE TABLE `{}`".format(object_name.replace("`", "``")))
+            row = cur.fetchone()
+            cur.close()
+            return str(row[1]) if row and len(row) > 1 else ""
+        if object_type == "index":
+            table_name, index_name = self._split_index_identity(object_name)
+            if not table_name:
+                cur.close()
+                return ""
+            cur.execute(
+                """
+                SELECT TABLE_NAME, GROUP_CONCAT(COLUMN_NAME ORDER BY SEQ_IN_INDEX)
+                FROM information_schema.statistics
+                WHERE table_schema = DATABASE() AND INDEX_NAME = %s AND TABLE_NAME = %s
+                GROUP BY TABLE_NAME
+                LIMIT 1
+                """,
+                (index_name, table_name),
+            )
+            row = cur.fetchone()
+            cur.close()
+            if not row:
+                return ""
+            return f"CREATE INDEX `{index_name}` ON `{row[0]}` ({row[1]});"
+        return ""
+
+    def get_index_info(self, index_name: str) -> tuple[list[str], list[tuple]]:
+        table_name, real_index_name = self._split_index_identity(index_name)
+        if not table_name:
+            return ["table_name", "index_name", "column_name", "non_unique", "seq_in_index"], []
+        cur = self.require_conn().cursor()
+        cur.execute(
+            """
+            SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, NON_UNIQUE, SEQ_IN_INDEX
+            FROM information_schema.statistics
+            WHERE table_schema = DATABASE() AND INDEX_NAME = %s AND TABLE_NAME = %s
+            ORDER BY TABLE_NAME, SEQ_IN_INDEX
+            """,
+            (real_index_name, table_name),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return ["table_name", "index_name", "column_name", "non_unique", "seq_in_index"], [tuple(r) for r in rows]
+
+    def table_exists(self, table_name: str) -> bool:
+        cur = self.require_conn().cursor()
+        cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE() AND table_name = %s
+            LIMIT 1
+            """,
+            (table_name,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return row is not None
+
+    def import_csv(self, file_path: Path, table_name: str, create_if_missing: bool) -> int:
+        with file_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                raise ValueError("CSV file has no header.")
+            columns = [c.strip() for c in reader.fieldnames if c and c.strip()]
+            rows = [tuple(row.get(col) for col in columns) for row in reader]
+        return self._import_rows(table_name, columns, rows, create_if_missing)
+
+    def import_parquet(self, file_path: Path, table_name: str, create_if_missing: bool) -> int:
+        try:
+            import pandas as pd  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Parquet import requires pandas (and pyarrow/fastparquet).") from exc
+        df = pd.read_parquet(file_path)
+        columns = [str(c) for c in df.columns]
+        rows = [tuple(None if v != v else v for v in row) for row in df.itertuples(index=False, name=None)]
+        return self._import_rows(table_name, columns, rows, create_if_missing)
+
+    def _import_rows(
+        self, table_name: str, columns: list[str], rows: list[tuple], create_if_missing: bool
+    ) -> int:
+        conn = self.require_conn()
+        cur = conn.cursor()
+        if create_if_missing and not self.table_exists(table_name):
+            defs = ", ".join([f"`{c}` TEXT" for c in columns])
+            cur.execute(f"CREATE TABLE `{table_name}` ({defs})")
+        placeholders = ", ".join(["%s"] * len(columns))
+        cols = ", ".join([f"`{c}`" for c in columns])
+        cur.executemany(f"INSERT INTO `{table_name}` ({cols}) VALUES ({placeholders})", rows)
+        conn.commit()
+        cur.close()
+        return len(rows)
+
+    @staticmethod
+    def _split_index_identity(value: str) -> tuple[str, str]:
+        if "." not in value:
+            return "", value
+        table_name, index_name = value.split(".", 1)
+        return table_name, index_name

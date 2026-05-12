@@ -27,7 +27,7 @@ from textual.widgets import (
 )
 
 from .connections import ConnectionStore
-from .db import DBManagerProtocol, DuckDBManager, SQLiteManager
+from .db import DBManagerProtocol, DuckDBManager, MySQLManager, SQLiteManager
 
 
 class FilePickerScreen(ModalScreen[Optional[str]]):
@@ -40,6 +40,8 @@ class FilePickerScreen(ModalScreen[Optional[str]]):
     def compose(self) -> ComposeResult:
         with Vertical(id="file-picker-modal"):
             title = "Select a SQLite database file" if self.db_type == "sqlite" else "Select a DuckDB database file"
+            if self.db_type == "mysql":
+                title = "MySQL uses URI (no file picker): mysql://user:pass@host:3306/database"
             yield Static(title)
             yield DirectoryTree(str(self.start_path), id="file-tree")
             with Horizontal(id="file-picker-actions"):
@@ -51,6 +53,10 @@ class FilePickerScreen(ModalScreen[Optional[str]]):
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         path = Path(event.path)
         allowed = {".db", ".db3", ".sqlite", ".sqlite3"} if self.db_type == "sqlite" else {".duckdb", ".ddb", ".db"}
+        if self.db_type == "mysql":
+            self.query_one("#file-picker-status", Static).update("MySQL uses URI; close this picker and paste URI.")
+            self.selected_file = None
+            return
         if path.suffix.lower() not in allowed:
             allowed_txt = ".db, .db3, .sqlite, .sqlite3" if self.db_type == "sqlite" else ".duckdb, .ddb, .db"
             self.query_one("#file-picker-status", Static).update(
@@ -446,6 +452,7 @@ class SQLiteTUI(App):
         self.db_managers: dict[str, DBManagerProtocol] = {
             "sqlite": SQLiteManager(),
             "duckdb": DuckDBManager(),
+            "mysql": MySQLManager(),
         }
         self.db: DBManagerProtocol = self.db_managers["sqlite"]
         self.connection_store = ConnectionStore()
@@ -473,7 +480,7 @@ class SQLiteTUI(App):
             yield Static("", id="header-datetime")
         with Horizontal(id="topbar"):
             yield Select(
-                [("SQLite", "sqlite"), ("DuckDB", "duckdb")],
+                [("SQLite", "sqlite"), ("DuckDB", "duckdb"), ("MySQL", "mysql")],
                 value="sqlite",
                 id="db-type",
                 allow_blank=False,
@@ -721,12 +728,20 @@ class SQLiteTUI(App):
             self._refresh_schema()
             self._refresh_db_info()
             conn_name = self.query_one("#conn-name", Input).value.strip()
-            self.connection_store.save_last_used(conn_name, str(Path(raw).expanduser().resolve()), self.db_type)
-            self._set_status(f"Connected ({self.db_type}) to: {Path(raw).expanduser().resolve()}")
+            stored_path = raw
+            shown_path = raw
+            if self.db_type != "mysql":
+                stored_path = str(Path(raw).expanduser().resolve())
+                shown_path = stored_path
+            self.connection_store.save_last_used(conn_name, stored_path, self.db_type)
+            self._set_status(f"Connected ({self.db_type}) to: {shown_path}")
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"Open failed: {exc}")
 
     def action_browse_db(self) -> None:
+        if self.db_type == "mysql":
+            self._set_status("MySQL uses URI. Example: mysql://user:pass@host:3306/database")
+            return
         current = self.query_one("#db-path", Input).value.strip()
         if current:
             candidate = Path(current).expanduser()
@@ -752,7 +767,7 @@ class SQLiteTUI(App):
             self._set_status("Please provide a database path.")
             return
 
-        path = str(Path(raw_path).expanduser().resolve())
+        path = raw_path if self.db_type == "mysql" else str(Path(raw_path).expanduser().resolve())
         replaced = False
         for idx, conn in enumerate(self.connections):
             if conn["name"] == name:
@@ -1590,10 +1605,31 @@ class SQLiteTUI(App):
             table.add_row("SQL", sql or "(no SQL definition)")
             table.add_row("", "")
             if cols and rows:
-                table.add_row("Indexed Columns", ", ".join(str(row[2]) for row in rows))
-                for row in rows:
-                    # PRAGMA index_info columns: seqno, cid, name
-                    table.add_row(f"Column seq {row[0]}", str(row[2]))
+                row_maps = [dict(zip(cols, row)) for row in rows]
+
+                def _first_present(m: dict[str, object], keys: list[str]) -> object | None:
+                    for key in keys:
+                        if key in m:
+                            return m[key]
+                    return None
+
+                col_values: list[str] = []
+                for m in row_maps:
+                    v = _first_present(m, ["name", "column_name", "expressions"])
+                    if v is not None:
+                        col_values.append(str(v))
+                if col_values:
+                    table.add_row("Indexed Columns", ", ".join(col_values))
+                else:
+                    table.add_row("Indexed Columns", "(not available)")
+
+                for idx, m in enumerate(row_maps, start=1):
+                    seq = _first_present(m, ["seqno", "seq_in_index"])
+                    seq_label = f"Entry {seq}" if seq is not None else f"Entry {idx}"
+                    details = []
+                    for c in cols:
+                        details.append(f"{c}={m.get(c)}")
+                    table.add_row(seq_label, ", ".join(details))
             else:
                 table.add_row("Indexed Columns", "(none)")
             self._set_data_sql_text(sql or "(no SQL definition)")
@@ -1999,18 +2035,23 @@ class SQLiteTUI(App):
         last = self.connection_store.load_last_used()
         if not last:
             return
-        try:
-            path = Path(last["path"]).expanduser().resolve()
-        except Exception:
-            return
-        if not path.exists():
-            return
         conn_type = str(last.get("type", "sqlite"))
         if conn_type not in self.db_managers:
             return
+        raw_path = str(last.get("path", "")).strip()
+        if not raw_path:
+            return
+        if conn_type != "mysql":
+            try:
+                path = Path(raw_path).expanduser().resolve()
+            except Exception:
+                return
+            if not path.exists():
+                return
+            raw_path = str(path)
         self.query_one("#db-type", Select).value = conn_type
         self._switch_db_type(conn_type)
-        self.query_one("#db-path", Input).value = str(path)
+        self.query_one("#db-path", Input).value = raw_path
         if last.get("name"):
             self.query_one("#conn-name", Input).value = str(last.get("name"))
         self.action_open_db()
@@ -2040,7 +2081,11 @@ class SQLiteTUI(App):
 
     @staticmethod
     def _default_db_path_for_type(db_type: str) -> str:
-        return "example.db" if db_type == "sqlite" else "example.duckdb"
+        if db_type == "sqlite":
+            return "example.db"
+        if db_type == "duckdb":
+            return "example.duckdb"
+        return "mysql://user:password@localhost:3306/database"
 
     @staticmethod
     def _sanitize_table_name(value: str) -> str:
