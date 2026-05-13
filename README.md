@@ -1,24 +1,30 @@
 # DDBB Manager TUI (Textual python library)
 
-Terminal UI app to inspect and manage DuckDB and SQLite databases from the terminal.
+Terminal UI app to inspect and manage SQLite, DuckDB, and MySQL databases from the terminal.
 
 ## Supported Engines
 
 - SQLite
 - DuckDB
+- MySQL
 
-Select the engine from the top bar (`SQLite` / `DuckDB`) before opening a DB file.
+Select the engine from the top bar before opening a connection.
 
 ## Features
 
 ### Connection and Session
-- Open database files from path input or browse modal.
+- Open database files/URIs from path input.
 - File picker with directory navigation (`Parent`, select file).
 - Engine-specific file filters:
   - SQLite: `.db`, `.db3`, `.sqlite`, `.sqlite3`
   - DuckDB: `.duckdb`, `.ddb`, `.db`
+  - MySQL: uses URI (no file picker)
+- MySQL connection URI format:
+  - `mysql://user:password@host:3306/database`
 - Save named connections with engine type.
-- Auto-reopen last used database on startup (if file still exists).
+- Auto-reopen last used connection on startup:
+  - SQLite/DuckDB: if file still exists
+  - MySQL: reconnect using saved URI
 
 ### Connection Management (Left Panel)
 - Grouped connections tree:
@@ -38,6 +44,7 @@ Select the engine from the top bar (`SQLite` / `DuckDB`) before opening a DB fil
 - Expand tables/views to see columns and column types.
 - Table row count shown in schema label.
 - Color-coded object type labels.
+- MySQL index nodes are identified as `table.index` to avoid name collisions.
 
 ### Database Info Panel
 - Database path, size, table/view counters, modified timestamp.
@@ -70,6 +77,7 @@ Select the engine from the top bar (`SQLite` / `DuckDB`) before opening a DB fil
 - Engine-aware explain behavior:
   - SQLite: `EXPLAIN QUERY PLAN` / `EXPLAIN`
   - DuckDB: `EXPLAIN` / `EXPLAIN ANALYZE`
+  - MySQL: `EXPLAIN` / `EXPLAIN ANALYZE` (server-version dependent)
 - Formatted explain output plus full raw output panel.
 - Explain panel auto-clears on context/query changes.
 
@@ -104,6 +112,10 @@ Select the engine from the top bar (`SQLite` / `DuckDB`) before opening a DB fil
 ## Requirements
 
 - Python 3.8+
+- Dependencies include:
+  - `textual`
+  - `duckdb`
+  - `mysql-connector-python`
 
 ## Install
 
@@ -129,8 +141,10 @@ python -m sqlite_tui
 
 ## Quick Usage
 
-1. Choose engine type (`SQLite` or `DuckDB`).
-2. Set DB path and click `Open DB` (or `Browse`).
+1. Choose engine type (`SQLite`, `DuckDB`, or `MySQL`).
+2. Set DB path/URI and click `Open DB`.
+   - For SQLite/DuckDB you can also use `Browse`.
+   - For MySQL, paste URI directly.
 3. Optionally save connection with `Register`.
 4. Explore schema and selected object details in `Data` and `DDL`.
 5. Use `Query` tabs for SQL execution, explain/analyze, and result export.
