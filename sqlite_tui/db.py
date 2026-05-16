@@ -8,6 +8,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import duckdb
 import mysql.connector
+try:
+    import psycopg
+except Exception:  # noqa: BLE001
+    psycopg = None  # type: ignore[assignment]
 
 
 class DBManagerProtocol(Protocol):
@@ -757,3 +761,300 @@ class MySQLManager:
             return "", value
         table_name, index_name = value.split(".", 1)
         return table_name, index_name
+
+
+class PostgreSQLManager:
+    def __init__(self) -> None:
+        self.conn: object | None = None
+        self.path: Path | None = None
+        self._pk_map: dict[int, str] = {}
+
+    def connect(self, db_path: str) -> None:
+        if psycopg is None:
+            raise RuntimeError("PostgreSQL support requires psycopg. Install dependency: psycopg[binary].")
+        parsed = urlparse(db_path)
+        scheme = parsed.scheme.lower()
+        if scheme not in {"postgresql", "postgres"}:
+            raise ValueError("PostgreSQL connection must use URI format: postgresql://user:pass@host:5432/database")
+        self.close()
+        self.conn = psycopg.connect(db_path)
+        self.path = Path(f"postgresql_{(parsed.path or '/db').lstrip('/')}.conn")
+
+    def close(self) -> None:
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+        self.path = None
+        self._pk_map = {}
+
+    def require_conn(self):
+        if self.conn is None:
+            raise RuntimeError("No database connection. Open a PostgreSQL connection first.")
+        return self.conn
+
+    def list_objects(self) -> list[tuple[str, str]]:
+        conn = self.require_conn()
+        rows: list[tuple[str, str]] = []
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_type, table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                ORDER BY table_type, table_name
+                """
+            )
+            for table_type, name in cur.fetchall():
+                rows.append(("table" if str(table_type) == "BASE TABLE" else "view", str(name)))
+            cur.execute(
+                """
+                SELECT indexname
+                FROM pg_indexes
+                WHERE schemaname = 'public'
+                ORDER BY indexname
+                """
+            )
+            for (index_name,) in cur.fetchall():
+                rows.append(("index", str(index_name)))
+            cur.execute(
+                """
+                SELECT trigger_name
+                FROM information_schema.triggers
+                WHERE trigger_schema = 'public'
+                ORDER BY trigger_name
+                """
+            )
+            for (trigger_name,) in cur.fetchall():
+                rows.append(("trigger", str(trigger_name)))
+        order = {"table": 1, "view": 2, "index": 3, "trigger": 4}
+        rows.sort(key=lambda x: (order.get(x[0], 99), x[1]))
+        return rows
+
+    def preview_table_with_rowid(
+        self, table_name: str, limit: int = 200, offset: int = 0
+    ) -> tuple[list[str], list[tuple], list[int]]:
+        conn = self.require_conn()
+        self._pk_map = {}
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT ctid::text AS "__rowid__", * FROM "{table_name.replace(chr(34), chr(34)*2)}" '
+                "LIMIT %s OFFSET %s",
+                (int(limit), int(offset)),
+            )
+            cols = [d.name for d in cur.description] if cur.description else []
+            raw_rows = cur.fetchall()
+        if not cols:
+            return [], [], []
+        rowids: list[int] = []
+        for idx, row in enumerate(raw_rows, start=1):
+            rowids.append(idx)
+            self._pk_map[idx] = str(row[0])
+        return cols[1:], [tuple(r[1:]) for r in raw_rows], rowids
+
+    def execute_sql(self, sql: str) -> tuple[list[str], list[tuple], str]:
+        conn = self.require_conn()
+        query = sql.strip()
+        if not query:
+            return [], [], "No SQL to execute."
+        with conn.cursor() as cur:
+            cur.execute(query)
+            if cur.description:
+                cols = [d.name for d in cur.description]
+                rows = cur.fetchall()
+                return cols, [tuple(r) for r in rows], f"{len(rows)} row(s)."
+            affected = cur.rowcount if cur.rowcount is not None else 0
+        conn.commit()
+        return [], [], f"Statement executed. Affected rows: {affected}."
+
+    def begin_transaction(self) -> None:
+        self.require_conn().execute("BEGIN")
+
+    def commit_transaction(self) -> None:
+        self.require_conn().commit()
+
+    def rollback_transaction(self) -> None:
+        self.require_conn().rollback()
+
+    def update_cell_by_rowid(
+        self, table_name: str, column_name: str, rowid: int, new_value: object
+    ) -> None:
+        ctid = self._pk_map.get(rowid)
+        if not ctid:
+            raise RuntimeError("No selected row context for update.")
+        with self.require_conn().cursor() as cur:
+            cur.execute(
+                f'UPDATE "{table_name.replace(chr(34), chr(34)*2)}" '
+                f'SET "{column_name.replace(chr(34), chr(34)*2)}" = %s WHERE ctid::text = %s',
+                (new_value, ctid),
+            )
+
+    def delete_row_by_rowid(self, table_name: str, rowid: int) -> None:
+        ctid = self._pk_map.get(rowid)
+        if not ctid:
+            raise RuntimeError("No selected row context for delete.")
+        with self.require_conn().cursor() as cur:
+            cur.execute(
+                f'DELETE FROM "{table_name.replace(chr(34), chr(34)*2)}" WHERE ctid::text = %s',
+                (ctid,),
+            )
+
+    def insert_row(self, table_name: str, values: dict[str, object]) -> None:
+        if not values:
+            raise ValueError("No values provided for insert.")
+        cols = [f'"{c.replace(chr(34), chr(34) * 2)}"' for c in values]
+        placeholders = ", ".join(["%s"] * len(values))
+        sql = f'INSERT INTO "{table_name.replace(chr(34), chr(34)*2)}" ({", ".join(cols)}) VALUES ({placeholders})'
+        with self.require_conn().cursor() as cur:
+            cur.execute(sql, list(values.values()))
+
+    def list_columns(self, table_name: str) -> Iterable[str]:
+        with self.require_conn().cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table_name,),
+            )
+            for row in cur.fetchall():
+                yield str(row[0])
+
+    def list_columns_with_types(self, table_name: str) -> Iterable[tuple[str, str]]:
+        with self.require_conn().cursor() as cur:
+            cur.execute(
+                """
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                ORDER BY ordinal_position
+                """,
+                (table_name,),
+            )
+            for row in cur.fetchall():
+                yield str(row[0]), str(row[1] or "UNKNOWN")
+
+    def count_rows(self, table_name: str) -> int:
+        with self.require_conn().cursor() as cur:
+            cur.execute(f'SELECT COUNT(*) FROM "{table_name.replace(chr(34), chr(34)*2)}"')
+            row = cur.fetchone()
+            return int(row[0] if row else 0)
+
+    def get_object_sql(self, object_type: str, object_name: str) -> str:
+        with self.require_conn().cursor() as cur:
+            if object_type == "view":
+                cur.execute(
+                    """
+                    SELECT definition
+                    FROM pg_views
+                    WHERE schemaname = 'public' AND viewname = %s
+                    LIMIT 1
+                    """,
+                    (object_name,),
+                )
+                row = cur.fetchone()
+                return f'CREATE VIEW "{object_name}" AS\n{row[0]}' if row and row[0] else ""
+            if object_type == "index":
+                cur.execute("SELECT pg_get_indexdef(%s::regclass)", (object_name,))
+                row = cur.fetchone()
+                return str(row[0]) if row and row[0] else ""
+            if object_type == "trigger":
+                cur.execute(
+                    """
+                    SELECT pg_get_triggerdef(t.oid)
+                    FROM pg_trigger t
+                    JOIN pg_class c ON c.oid = t.tgrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE NOT t.tgisinternal
+                      AND n.nspname = 'public'
+                      AND t.tgname = %s
+                    LIMIT 1
+                    """,
+                    (object_name,),
+                )
+                row = cur.fetchone()
+                return str(row[0]) if row and row[0] else ""
+            if object_type == "table":
+                cols = list(self.list_columns_with_types(object_name))
+                if not cols:
+                    return ""
+                defs = ",\n  ".join([f'"{c}" {t}' for c, t in cols])
+                return f'CREATE TABLE "{object_name}" (\n  {defs}\n)'
+        return ""
+
+    def get_index_info(self, index_name: str) -> tuple[list[str], list[tuple]]:
+        with self.require_conn().cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  i.indexname,
+                  i.tablename,
+                  a.attname,
+                  ix.indisunique,
+                  s.n
+                FROM pg_indexes i
+                JOIN pg_class ic ON ic.relname = i.indexname
+                JOIN pg_index ix ON ix.indexrelid = ic.oid
+                JOIN LATERAL generate_subscripts(ix.indkey, 1) AS s(n) ON TRUE
+                JOIN pg_attribute a
+                  ON a.attrelid = ix.indrelid
+                 AND a.attnum = ix.indkey[s.n]
+                WHERE i.schemaname = 'public'
+                  AND i.indexname = %s
+                ORDER BY s.n
+                """,
+                (index_name,),
+            )
+            rows = cur.fetchall()
+        return ["index_name", "table_name", "column_name", "is_unique", "seq_in_index"], [tuple(r) for r in rows]
+
+    def table_exists(self, table_name: str) -> bool:
+        with self.require_conn().cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+                LIMIT 1
+                """,
+                (table_name,),
+            )
+            return cur.fetchone() is not None
+
+    def import_csv(self, file_path: Path, table_name: str, create_if_missing: bool) -> int:
+        with file_path.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                raise ValueError("CSV file has no header.")
+            columns = [c.strip() for c in reader.fieldnames if c and c.strip()]
+            rows = [tuple(row.get(col) for col in columns) for row in reader]
+        return self._import_rows(table_name, columns, rows, create_if_missing)
+
+    def import_parquet(self, file_path: Path, table_name: str, create_if_missing: bool) -> int:
+        try:
+            import pandas as pd  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError("Parquet import requires pandas (and pyarrow/fastparquet).") from exc
+        df = pd.read_parquet(file_path)
+        columns = [str(c) for c in df.columns]
+        rows = [tuple(None if v != v else v for v in row) for row in df.itertuples(index=False, name=None)]
+        return self._import_rows(table_name, columns, rows, create_if_missing)
+
+    def _import_rows(
+        self, table_name: str, columns: list[str], rows: list[tuple], create_if_missing: bool
+    ) -> int:
+        conn = self.require_conn()
+        escaped_table = table_name.replace('"', '""')
+        escaped_cols = [f'"{c.replace(chr(34), chr(34) * 2)}"' for c in columns]
+        if create_if_missing and not self.table_exists(table_name):
+            with conn.cursor() as cur:
+                cur.execute(f'CREATE TABLE "{escaped_table}" ({", ".join(f"{c} TEXT" for c in escaped_cols)})')
+        placeholders = ", ".join(["%s"] * len(columns))
+        with conn.cursor() as cur:
+            cur.executemany(
+                f'INSERT INTO "{escaped_table}" ({", ".join(escaped_cols)}) VALUES ({placeholders})',
+                rows,
+            )
+        conn.commit()
+        return len(rows)

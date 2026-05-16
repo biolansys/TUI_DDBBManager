@@ -19,6 +19,7 @@ from textual.widgets import (
     Select,
     Header,
     Input,
+    Markdown,
     Static,
     TabbedContent,
     TabPane,
@@ -27,7 +28,7 @@ from textual.widgets import (
 )
 
 from .connections import ConnectionStore
-from .db import DBManagerProtocol, DuckDBManager, MySQLManager, SQLiteManager
+from .db import DBManagerProtocol, DuckDBManager, MySQLManager, PostgreSQLManager, SQLiteManager
 
 
 class FilePickerScreen(ModalScreen[Optional[str]]):
@@ -42,6 +43,8 @@ class FilePickerScreen(ModalScreen[Optional[str]]):
             title = "Select a SQLite database file" if self.db_type == "sqlite" else "Select a DuckDB database file"
             if self.db_type == "mysql":
                 title = "MySQL uses URI (no file picker): mysql://user:pass@host:3306/database"
+            elif self.db_type == "postgresql":
+                title = "PostgreSQL uses URI (no file picker): postgresql://user:pass@host:5432/database"
             yield Static(title)
             yield DirectoryTree(str(self.start_path), id="file-tree")
             with Horizontal(id="file-picker-actions"):
@@ -53,8 +56,11 @@ class FilePickerScreen(ModalScreen[Optional[str]]):
     def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
         path = Path(event.path)
         allowed = {".db", ".db3", ".sqlite", ".sqlite3"} if self.db_type == "sqlite" else {".duckdb", ".ddb", ".db"}
-        if self.db_type == "mysql":
-            self.query_one("#file-picker-status", Static).update("MySQL uses URI; close this picker and paste URI.")
+        if self.db_type in {"mysql", "postgresql"}:
+            engine = "MySQL" if self.db_type == "mysql" else "PostgreSQL"
+            self.query_one("#file-picker-status", Static).update(
+                f"{engine} uses URI; close this picker and paste URI."
+            )
             self.selected_file = None
             return
         if path.suffix.lower() not in allowed:
@@ -433,6 +439,36 @@ class ImportWizardScreen(ModalScreen[Optional[dict[str, Any]]]):
         return "\n".join(lines)
 
 
+class HelpScreen(ModalScreen[None]):
+    BINDINGS = [("escape", "dismiss", "Close")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.help_text = self._load_readme_text()
+
+    @staticmethod
+    def _load_readme_text() -> str:
+        readme_path = Path(__file__).resolve().parent.parent / "README.md"
+        try:
+            text = readme_path.read_text(encoding="utf-8")
+            return text.strip() if text.strip() else "README.md is empty."
+        except Exception as exc:  # noqa: BLE001
+            return f"Could not load README.md:\n{exc}"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="file-picker-modal"):
+            yield Static("Help (README.md)")
+            with VerticalScroll(id="help-scroll"):
+                yield Static(" ", id="help-top-accent")
+                yield Markdown(self.help_text, id="help-markdown")
+            with Horizontal(id="file-picker-actions"):
+                yield Button("Close", id="help-close", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "help-close":
+            self.dismiss(None)
+
+
 class SQLiteTUI(App):
     CSS_PATH = "app.tcss"
     TITLE = "DDBB Manager"
@@ -444,6 +480,7 @@ class SQLiteTUI(App):
         ("ctrl+i", "import_file", "Import File"),
         ("ctrl+m", "export_markdown", "Export MD"),
         ("ctrl+d", "export_schema_sql", "Export DDL"),
+        ("ctrl+h", "show_help", "Help"),
     ]
 
     def __init__(self) -> None:
@@ -453,6 +490,7 @@ class SQLiteTUI(App):
             "sqlite": SQLiteManager(),
             "duckdb": DuckDBManager(),
             "mysql": MySQLManager(),
+            "postgresql": PostgreSQLManager(),
         }
         self.db: DBManagerProtocol = self.db_managers["sqlite"]
         self.connection_store = ConnectionStore()
@@ -480,7 +518,7 @@ class SQLiteTUI(App):
             yield Static("", id="header-datetime")
         with Horizontal(id="topbar"):
             yield Select(
-                [("SQLite", "sqlite"), ("DuckDB", "duckdb"), ("MySQL", "mysql")],
+                [("SQLite", "sqlite"), ("DuckDB", "duckdb"), ("MySQL", "mysql"), ("PostgreSQL", "postgresql")],
                 value="sqlite",
                 id="db-type",
                 allow_blank=False,
@@ -730,7 +768,7 @@ class SQLiteTUI(App):
             conn_name = self.query_one("#conn-name", Input).value.strip()
             stored_path = raw
             shown_path = raw
-            if self.db_type != "mysql":
+            if self.db_type not in {"mysql", "postgresql"}:
                 stored_path = str(Path(raw).expanduser().resolve())
                 shown_path = stored_path
             self.connection_store.save_last_used(conn_name, stored_path, self.db_type)
@@ -741,6 +779,9 @@ class SQLiteTUI(App):
     def action_browse_db(self) -> None:
         if self.db_type == "mysql":
             self._set_status("MySQL uses URI. Example: mysql://user:pass@host:3306/database")
+            return
+        if self.db_type == "postgresql":
+            self._set_status("PostgreSQL uses URI. Example: postgresql://user:pass@host:5432/database")
             return
         current = self.query_one("#db-path", Input).value.strip()
         if current:
@@ -767,7 +808,11 @@ class SQLiteTUI(App):
             self._set_status("Please provide a database path.")
             return
 
-        path = raw_path if self.db_type == "mysql" else str(Path(raw_path).expanduser().resolve())
+        path = (
+            raw_path
+            if self.db_type in {"mysql", "postgresql"}
+            else str(Path(raw_path).expanduser().resolve())
+        )
         replaced = False
         for idx, conn in enumerate(self.connections):
             if conn["name"] == name:
@@ -852,10 +897,16 @@ class SQLiteTUI(App):
             return
         conn_type = str(self.selected_connection.get("type", "sqlite"))
         path = self.selected_connection.get("path", "")
-        if conn_type not in {"sqlite", "duckdb"}:
+        if conn_type not in {"sqlite", "duckdb", "mysql", "postgresql"}:
             self._set_status(f"Unsupported connection type: {conn_type}")
             return
-        manager: DBManagerProtocol = SQLiteManager() if conn_type == "sqlite" else DuckDBManager()
+        manager_map: dict[str, DBManagerProtocol] = {
+            "sqlite": SQLiteManager(),
+            "duckdb": DuckDBManager(),
+            "mysql": MySQLManager(),
+            "postgresql": PostgreSQLManager(),
+        }
+        manager: DBManagerProtocol = manager_map[conn_type]
         try:
             manager.connect(path)
             _ = manager.list_objects()
@@ -906,6 +957,9 @@ class SQLiteTUI(App):
         self._clear_explain_tab()
         self._clear_ddl_tab()
         self._run_query_for_page(reset_page=True)
+
+    def action_show_help(self) -> None:
+        self.push_screen(HelpScreen())
 
     def _run_query_for_page(self, reset_page: bool = False) -> None:
         editor, table = self._get_active_query_widgets()
@@ -2041,7 +2095,7 @@ class SQLiteTUI(App):
         raw_path = str(last.get("path", "")).strip()
         if not raw_path:
             return
-        if conn_type != "mysql":
+        if conn_type not in {"mysql", "postgresql"}:
             try:
                 path = Path(raw_path).expanduser().resolve()
             except Exception:
@@ -2085,6 +2139,8 @@ class SQLiteTUI(App):
             return "example.db"
         if db_type == "duckdb":
             return "example.duckdb"
+        if db_type == "postgresql":
+            return "postgresql://user:password@localhost:5432/database"
         return "mysql://user:password@localhost:3306/database"
 
     @staticmethod

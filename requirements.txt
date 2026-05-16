@@ -1,3 +1,4 @@
 textual>=0.66.0
 duckdb>=1.0.0
 mysql-connector-python>=9.0.0
+psycopg[binary]>=3.2.0

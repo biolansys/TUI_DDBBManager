@@ -203,3 +203,12 @@ Screen {
     color: $text-muted;
     margin-top: 0;
 }
+#help-top-accent {
+    height: 1;
+    background: $accent;
+    margin-bottom: 1;
+}
+
+#help-markdown {
+    padding: 0 1;
+}
