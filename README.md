@@ -1,12 +1,13 @@
 # DDBB Manager TUI (Textual python library)
 
-Terminal UI app to inspect and manage SQLite, DuckDB, and MySQL databases from the terminal.
+Terminal UI app to inspect and manage SQLite, DuckDB, MySQL, and PostgreSQL databases from the terminal.
 
 ## Supported Engines
 
 - SQLite
 - DuckDB
 - MySQL
+- PostgreSQL
 
 Select the engine from the top bar before opening a connection.
 
@@ -18,13 +19,15 @@ Select the engine from the top bar before opening a connection.
 - Engine-specific file filters:
   - SQLite: `.db`, `.db3`, `.sqlite`, `.sqlite3`
   - DuckDB: `.duckdb`, `.ddb`, `.db`
-  - MySQL: uses URI (no file picker)
+  - MySQL/PostgreSQL: use URI (no file picker)
 - MySQL connection URI format:
   - `mysql://user:password@host:3306/database`
+- PostgreSQL connection URI format:
+  - `postgresql://user:password@host:5432/database`
 - Save named connections with engine type.
 - Auto-reopen last used connection on startup:
   - SQLite/DuckDB: if file still exists
-  - MySQL: reconnect using saved URI
+  - MySQL/PostgreSQL: reconnect using saved URI
 
 ### Connection Management (Left Panel)
 - Grouped connections tree:
@@ -78,6 +81,7 @@ Select the engine from the top bar before opening a connection.
   - SQLite: `EXPLAIN QUERY PLAN` / `EXPLAIN`
   - DuckDB: `EXPLAIN` / `EXPLAIN ANALYZE`
   - MySQL: `EXPLAIN` / `EXPLAIN ANALYZE` (server-version dependent)
+  - PostgreSQL: `EXPLAIN` / `EXPLAIN ANALYZE`
 - Formatted explain output plus full raw output panel.
 - Explain panel auto-clears on context/query changes.
 
@@ -108,6 +112,7 @@ Select the engine from the top bar before opening a connection.
 ### Header / UI
 - Header title: `DDBB Manager`.
 - Right-aligned date-time display (`dd/mm/yyyy HH:MM:SS`).
+- Help modal (`Ctrl+H`) that renders `README.md` with markdown formatting.
 
 ## Requirements
 
@@ -116,6 +121,7 @@ Select the engine from the top bar before opening a connection.
   - `textual`
   - `duckdb`
   - `mysql-connector-python`
+  - `psycopg[binary]`
 
 ## Install
 
@@ -138,13 +144,14 @@ python -m sqlite_tui
 - `Ctrl+I`: Import file (CSV/Parquet wizard)
 - `Ctrl+M`: Export DB report to Markdown
 - `Ctrl+D`: Export DB schema to SQL
+- `Ctrl+H`: Open Help modal
 
 ## Quick Usage
 
-1. Choose engine type (`SQLite`, `DuckDB`, or `MySQL`).
+1. Choose engine type (`SQLite`, `DuckDB`, `MySQL`, or `PostgreSQL`).
 2. Set DB path/URI and click `Open DB`.
-   - For SQLite/DuckDB you can also use `Browse`.
-   - For MySQL, paste URI directly.
+   - For SQLite/DuckDB you can use `Browse`.
+   - For MySQL/PostgreSQL, paste URI directly.
 3. Optionally save connection with `Register`.
 4. Explore schema and selected object details in `Data` and `DDL`.
 5. Use `Query` tabs for SQL execution, explain/analyze, and result export.
